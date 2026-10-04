@@ -1,5 +1,6 @@
 import csv
 import copy
+import time
 import itertools
 from collections import deque
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ class HandDetectionResult:
     handedness: str
     keypoint_label: str
     keypoint_id: int
+    confidence: float  # Уверенность топового жеста (0.0 - 1.0)
+    probabilities: List[float]  # Вероятности всех классов
     point_history_label: str
     landmarks: List[Tuple[int, int]]
     bounding_box: Tuple[int, int, int, int]
@@ -39,24 +42,19 @@ class FrameResult:
 
 class GestureEngine:
     def __init__(
-        self,
-        landmarker_model_path: str = "models/hand_landmarker.task",
-        keypoint_model_path: str = "models/keypoint_classifier.tflite",
-        keypoint_labels_path: str = "models/keypoint_classifier_label.csv",
-        history_model_path: Optional[str] = "models/point_history_classifier.tflite",
-        history_labels_path: Optional[str] = "models/point_history_classifier_label.csv",
-        max_num_hands: int = 1,
-        min_detection_confidence: float = 0.7,
-        min_hand_presence_confidence=0.4,
-        min_tracking_confidence: float = 0.5,
-
+            self,
+            landmarker_model_path: str = "models/hand_landmarker.task",
+            keypoint_model_path: str = "models/keypoint_classifier.tflite",
+            keypoint_labels_path: str = "models/keypoint_classifier_label.csv",
+            history_model_path: Optional[str] = "models/point_history_classifier.tflite",
+            history_labels_path: Optional[str] = "models/point_history_classifier_label.csv",
+            max_num_hands: int = 1,
+            min_detection_confidence: float = 0.4,
+            min_tracking_confidence: float = 0.4,
+            enable_clahe: bool = True
     ):
-        # 1. Инициализация современного MediaPipe HandLandmarker
         if not Path(landmarker_model_path).exists():
-            raise FileNotFoundError(
-                f"Файл {landmarker_model_path} не найден! "
-                f"Скачайте его по ссылке: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-            )
+            raise FileNotFoundError(f"Файл {landmarker_model_path} не найден!")
 
         base_options = python.BaseOptions(model_asset_path=landmarker_model_path)
         options = vision.HandLandmarkerOptions(
@@ -64,17 +62,18 @@ class GestureEngine:
             running_mode=vision.RunningMode.VIDEO,
             num_hands=max_num_hands,
             min_hand_detection_confidence=min_detection_confidence,
-            min_hand_presence_confidence=min_hand_presence_confidence,
+            min_hand_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
-
         self._last_timestamp_ms = 0
-        # 2. Буфер истории кончика указательного пальца (точка №8)
+
+        self.enable_clahe = enable_clahe
+        self.clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
         self.history_length = 16
         self.point_history = deque([(0, 0)] * self.history_length, maxlen=self.history_length)
 
-        # 3. Загрузка классификатора жестов
         self.keypoint_interpreter = self._load_tflite_model(keypoint_model_path)
         self.keypoint_labels = self._load_labels(keypoint_labels_path)
 
@@ -95,9 +94,10 @@ class GestureEngine:
             reader = csv.reader(f)
             return [row[0] for row in reader if row]
 
-    def _predict_tflite(self, interpreter, input_vector: list) -> int:
+    def _predict_tflite(self, interpreter, input_vector: list) -> Tuple[int, float, List[float]]:
+        """Возвращает: ID лучшего класса, максимальную вероятность и список вероятностей всех классов"""
         if interpreter is None:
-            return -1
+            return -1, 0.0, []
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
 
@@ -105,9 +105,15 @@ class GestureEngine:
         interpreter.set_tensor(input_details[0]["index"], input_data)
         interpreter.invoke()
         output = interpreter.get_tensor(output_details[0]["index"])
-        return int(np.argmax(np.squeeze(output)))
 
-    # --- Предобработка координат (полностью сохранена оригинальная математика) ---
+        # Получаем массив вероятностей (после Softmax)
+        probabilities = np.squeeze(output).tolist()
+        if isinstance(probabilities, float):
+            probabilities = [probabilities]
+
+        class_id = int(np.argmax(probabilities))
+        confidence = float(probabilities[class_id])
+        return class_id, confidence, probabilities
 
     @staticmethod
     def _calc_landmarks(w: int, h: int, landmarks_list) -> List[Tuple[int, int]]:
@@ -134,71 +140,57 @@ class GestureEngine:
         max_val = max(map(abs, flat)) or 1.0
         return [v / max_val for v in flat]
 
-    def _pre_process_point_history(self, w: int, h: int) -> List[float]:
-        temp = list(self.point_history)
-        base_x, base_y = temp[0]
-
-        flat = []
-        for pt in temp:
-            flat.append((pt[0] - base_x) / w)
-            flat.append((pt[1] - base_y) / h)
-        return flat
-
-    # --- Обработка кадра ---
-
     def process(self, frame: np.ndarray, draw_overlay: bool = True) -> FrameResult:
-        import time
-
         debug_image = copy.deepcopy(frame)
         h, w = frame.shape[:2]
 
-        rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        if self.enable_clahe:
+            lab = cv.cvtColor(frame, cv.COLOR_BGR2LAB)
+            l, a, b = cv.split(lab)
+            l_enhanced = self.clahe.apply(l)
+            enhanced_lab = cv.merge((l_enhanced, a, b))
+            rgb_frame = cv.cvtColor(enhanced_lab, cv.COLOR_LAB2RGB)
+        else:
+            rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        # Для режима VIDEO обязательно передавать монотонно растущее время кадра в мс
         current_timestamp_ms = int(time.time() * 1000)
         if current_timestamp_ms <= self._last_timestamp_ms:
             current_timestamp_ms = self._last_timestamp_ms + 1
         self._last_timestamp_ms = current_timestamp_ms
 
-        # Используем detect_for_video вместо detect
         detection_result = self.detector.detect_for_video(mp_image, current_timestamp_ms)
         detected_hands: List[HandDetectionResult] = []
 
         if detection_result.hand_landmarks:
             for hand_landmarks, handedness_info in zip(
-                detection_result.hand_landmarks, detection_result.handedness
+                    detection_result.hand_landmarks, detection_result.handedness
             ):
                 landmarks = self._calc_landmarks(w, h, hand_landmarks)
                 bbox = self._calc_bounding_box(landmarks)
+
                 raw_handedness = handedness_info[0].category_name
-                # Инвертируем определение руки из-за зеркалирования кадра (cv.flip)
                 handedness = "Right" if raw_handedness == "Left" else "Left"
 
-                # Классификация статического жеста
                 pre_processed_landmarks = self._pre_process_landmarks(landmarks)
-                keypoint_id = self._predict_tflite(self.keypoint_interpreter, pre_processed_landmarks)
+                keypoint_id, confidence, probabilities = self._predict_tflite(
+                    self.keypoint_interpreter, pre_processed_landmarks
+                )
+
                 keypoint_label = (
                     self.keypoint_labels[keypoint_id]
                     if 0 <= keypoint_id < len(self.keypoint_labels)
                     else "Unknown"
                 )
 
-                # Классификация динамического жеста
-                self.point_history.append(landmarks[8])
-                pre_processed_history = self._pre_process_point_history(w, h)
-                history_id = self._predict_tflite(self.history_interpreter, pre_processed_history)
-                history_label = (
-                    self.history_labels[history_id]
-                    if 0 <= history_id < len(self.history_labels)
-                    else ""
-                )
-
                 hand_result = HandDetectionResult(
                     handedness=handedness,
                     keypoint_label=keypoint_label,
                     keypoint_id=keypoint_id,
-                    point_history_label=history_label,
+                    confidence=confidence,
+                    probabilities=probabilities,
+                    point_history_label="",
                     landmarks=landmarks,
                     bounding_box=bbox,
                 )
@@ -206,10 +198,54 @@ class GestureEngine:
 
                 if draw_overlay:
                     self._draw_overlay(debug_image, hand_result)
-        else:
-            self.point_history.append((0, 0))
-
+                    # Отрисовка панели вероятностей как в Teachable Machine
+                    self._draw_probability_bars(debug_image, hand_result)
         return FrameResult(annotated_image=debug_image, hands=detected_hands)
+
+    def _draw_probability_bars(self, image: np.ndarray, hand: HandDetectionResult):
+        """Отрисовка блока с полосами вероятностей для каждого класса"""
+        if not self.keypoint_labels or not hand.probabilities:
+            return
+
+        h, w = image.shape[:2]
+        panel_w = 260
+        bar_h = 16
+        spacing = 38
+        panel_h = len(self.keypoint_labels) * spacing + 40
+        start_x = w - panel_w - 20
+        start_y = 20
+
+        # Полупрозрачная темная подложка (HUD)
+        overlay = image.copy()
+        cv.rectangle(overlay, (start_x - 10, start_y - 10), (w - 10, start_y + panel_h), (25, 25, 25), -1)
+        cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+
+        # Заголовок панели
+        cv.putText(image, "Gesture Probabilities:", (start_x, start_y + 15),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+        # Рисуем полосу для каждого класса
+        for idx, (label, prob) in enumerate(zip(self.keypoint_labels, hand.probabilities)):
+            y = start_y + 35 + idx * spacing
+            percent = int(prob * 100)
+
+            # Название жеста и процент
+            cv.putText(image, f"{label}: {percent}%", (start_x, y),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1)
+
+            # Фон полосы (серый)
+            bar_y = y + 5
+            bar_max_w = panel_w - 20
+            cv.rectangle(image, (start_x, bar_y), (start_x + bar_max_w, bar_y + bar_h), (60, 60, 60), -1)
+
+            # Заполненная часть полосы
+            fill_w = int(bar_max_w * prob)
+            # Если это лидер классификации — подсвечиваем сочным зеленым, остальные — серым/синим
+            is_top = (idx == hand.keypoint_id and prob > 0.4)
+            bar_color = (0, 255, 128) if is_top else (180, 130, 70)
+
+            if fill_w > 0:
+                cv.rectangle(image, (start_x, bar_y), (start_x + fill_w, bar_y + bar_h), bar_color, -1)
 
     def _draw_overlay(self, image: np.ndarray, hand: HandDetectionResult):
         x1, y1, x2, y2 = hand.bounding_box
@@ -229,7 +265,7 @@ class GestureEngine:
         for pt in hand.landmarks:
             cv.circle(image, pt, 4, (0, 128, 255), -1)
 
-        text = f"{hand.handedness}: {hand.keypoint_label}"
-        if hand.point_history_label:
-            text += f" | {hand.point_history_label}"
+        # Текст над рукой с уверенностью в %
+        percent = int(hand.confidence * 100)
+        text = f"{hand.handedness}: {hand.keypoint_label} ({percent}%)"
         cv.putText(image, text, (x1, max(y1 - 10, 20)), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)

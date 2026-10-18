@@ -1,3 +1,7 @@
+pyautogui
+pynput
+pillow
+customtkinter
 scikit-learn
 tflite-runtime
 opencv-python>=4.8.0
